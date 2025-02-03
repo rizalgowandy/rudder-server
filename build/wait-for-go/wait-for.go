@@ -11,7 +11,7 @@ import (
 
 // Usage example
 // go run build/wait-for-go/wait-for.go -u -t 10 localhost:8125 && go run main.go
-func canConnect(host string, port string, protocol string) bool {
+func canConnect(host, port, protocol string) bool {
 	timeout := time.Second
 	conn, err := net.DialTimeout(protocol, net.JoinHostPort(host, port), timeout)
 	if err != nil {
@@ -28,12 +28,11 @@ func canConnect(host string, port string, protocol string) bool {
 				fmt.Println("UDP error:", err)
 				if err != nil {
 					_ = conn.Close()
-					conn = nil
 					return false
 				}
 			}
 		}
-		conn.Close()
+		_ = conn.Close()
 		fmt.Println("Opened", net.JoinHostPort(host, port))
 		return true
 	}
@@ -45,7 +44,7 @@ func main() {
 	udp := flag.Bool("u", false, "check for udp")
 	timeout := flag.Int("t", 60, "Timeout in seconds")
 	flag.Parse()
-	if *udp == true {
+	if *udp {
 		protocol = "udp"
 	}
 	hostport := flag.Args()
@@ -58,7 +57,7 @@ func main() {
 		if connected {
 			os.Exit(0)
 		}
-		time.Sleep(time.Duration(1 * time.Second))
+		time.Sleep(time.Second)
 	}
 	os.Exit(1)
 }
