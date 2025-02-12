@@ -1,177 +1,62 @@
-//go:generate mockgen -destination=../../mocks/services/dedup/mock_dedup.go -package mock_dedup github.com/rudderlabs/rudder-server/services/dedup DedupI
+//go:generate mockgen -destination=../../mocks/services/dedup/mock_dedup.go -package mock_dedup github.com/rudderlabs/rudder-server/services/dedup Dedup
 
 package dedup
 
 import (
-	"fmt"
-	"sort"
-	"time"
-
-	badger "github.com/dgraph-io/badger/v2"
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/rruntime"
-	"github.com/rudderlabs/rudder-server/services/stats"
-	"github.com/rudderlabs/rudder-server/utils/logger"
-	"github.com/rudderlabs/rudder-server/utils/misc"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	"github.com/rudderlabs/rudder-server/services/dedup/badger"
+	"github.com/rudderlabs/rudder-server/services/dedup/mirrorBadger"
+	"github.com/rudderlabs/rudder-server/services/dedup/mirrorScylla"
+	"github.com/rudderlabs/rudder-server/services/dedup/scylla"
+	"github.com/rudderlabs/rudder-server/services/dedup/types"
 )
 
-type DedupI interface {
-	FindDuplicates(messageIDs []string, allMessageIDsSet map[string]struct{}) (duplicateIndexes []int)
-	MarkProcessed(messageIDs []string)
-	PrintHistogram()
-}
+type Mode string
 
-type DedupHandleT struct {
-	badgerDB *badger.DB
-	stats    stats.Stats
-}
-
-var (
-	dedupWindow time.Duration
-	pkgLogger   logger.LoggerI
+const (
+	Badger       Mode = "Badger"
+	Scylla       Mode = "Scylla"
+	MirrorScylla Mode = "MirrorScylla"
+	MirrorBadger Mode = "MirrorBadger"
 )
 
-func Init() {
-	loadConfig()
-	pkgLogger = logger.NewLogger().Child("dedup")
-}
-
-func loadConfig() {
-	// Dedup time window in hours
-	config.RegisterDurationConfigVariable(time.Duration(3600), &dedupWindow, true, time.Second, []string{"Dedup.dedupWindow", "Dedup.dedupWindowInS"}...)
-}
-
-func (d *DedupHandleT) setup(clearDB *bool) {
-	d.stats = stats.DefaultStats
-	badgerLogger = &loggerT{}
-	d.openBadger(clearDB)
-}
-
-var badgerLogger badger.Logger
-
-type loggerT struct{}
-
-func (l *loggerT) Errorf(s string, args ...interface{}) {
-	pkgLogger.Errorf(s, args)
-}
-
-func (l *loggerT) Warningf(s string, args ...interface{}) {
-	pkgLogger.Warnf(s, args)
-}
-
-func (l *loggerT) Infof(s string, args ...interface{}) {
-	pkgLogger.Infof(s, args)
-}
-
-func (l *loggerT) Debugf(s string, args ...interface{}) {
-	pkgLogger.Debugf(s, args)
-}
-
-func (d *DedupHandleT) openBadger(clearDB *bool) {
-	var err error
-	badgerPathName := "/badgerdbv2"
-	tmpDirPath, err := misc.CreateTMPDIR()
-	if err != nil {
-		panic(err)
-	}
-	path := fmt.Sprintf(`%v%v`, tmpDirPath, badgerPathName)
-
-	d.badgerDB, err = badger.Open(badger.DefaultOptions(path).WithTruncate(true).WithLogger(badgerLogger))
-	if err != nil {
-		panic(err)
-	}
-	if *clearDB {
-		err = d.badgerDB.DropAll()
+// New creates a new deduplication service. The service needs to be closed after use.
+func New(conf *config.Config, stats stats.Stats) (Dedup, error) {
+	mode := Mode(conf.GetString("Dedup.Mode", string(Badger)))
+	switch mode {
+	case Badger:
+		return badger.NewBadgerDB(conf, stats, badger.DefaultPath()), nil
+	case Scylla:
+		scylla, err := scylla.New(conf, stats)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-	}
-	rruntime.Go(func() {
-		d.gcBadgerDB()
-	})
-}
-
-func (d *DedupHandleT) PrintHistogram() {
-	d.badgerDB.PrintHistogram(nil)
-}
-
-func (d *DedupHandleT) gcBadgerDB() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-	again:
-		err := d.badgerDB.RunValueLogGC(0.5)
-		if err == nil {
-			goto again
-		}
+		return scylla, nil
+	case MirrorScylla:
+		// Writes happen to both
+		// Read only from Scylla
+		return mirrorScylla.NewMirrorScylla(conf, stats)
+	case MirrorBadger:
+		// Writes happen to both
+		// Read only from Badger
+		return mirrorBadger.NewMirrorBadger(conf, stats)
+	default:
+		return badger.NewBadgerDB(conf, stats, badger.DefaultPath()), nil
 	}
 }
 
-func (d *DedupHandleT) writeToBadger(messageIDs []string) {
-	err := d.badgerDB.Update(func(txn *badger.Txn) error {
-		for _, messageID := range messageIDs {
-			e := badger.NewEntry([]byte(messageID), nil).WithTTL(dedupWindow * time.Second)
-			if err := txn.SetEntry(e); err == badger.ErrTxnTooBig {
-				_ = txn.Commit()
-				txn = d.badgerDB.NewTransaction(true)
-				_ = txn.SetEntry(e)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		panic(err)
-	}
-}
+// Dedup is the interface for deduplication service
+type Dedup interface {
+	// Get returns [true] if it was the first time the key was encountered, otherwise it returns [false] along with the previous value
+	Get(kv types.KeyValue) (bool, error)
 
-func (d *DedupHandleT) MarkProcessed(messageIDs []string) {
-	d.writeToBadger(messageIDs)
-}
+	// GetBatch
+	GetBatch(kvs []types.KeyValue) (map[types.KeyValue]bool, error)
 
-func (d *DedupHandleT) FindDuplicates(messageIDs []string, allMessageIDsSet map[string]struct{}) (duplicateIndexes []int) {
-	toRemoveMessageIndexesSet := make(map[int]struct{})
-	//Dedup within events batch in a web request
-	messageIDSet := make(map[string]struct{})
+	// Commit commits a list of previously set keys to the DB
+	Commit(keys []string) error
 
-	// Eg messageIDs: [m1, m2, m3, m1, m1, m1]
-	//Constructing a set out of messageIDs
-	for _, messageID := range messageIDs {
-		messageIDSet[messageID] = struct{}{}
-	}
-	// Eg messagIDSet: [m1, m2, m3]
-	//In this loop it will remove from set for first occurance and if not found in set it means its a duplicate
-	for idx, messageID := range messageIDs {
-		if _, ok := messageIDSet[messageID]; ok {
-			delete(messageIDSet, messageID)
-		} else {
-			toRemoveMessageIndexesSet[idx] = struct{}{}
-		}
-	}
-	//Dedup within batch of batch jobs
-	for idx, messageID := range messageIDs {
-		if _, ok := allMessageIDsSet[messageID]; ok {
-			toRemoveMessageIndexesSet[idx] = struct{}{}
-		}
-	}
-
-	//Dedup with badgerDB
-	err := d.badgerDB.View(func(txn *badger.Txn) error {
-		for idx, messageID := range messageIDs {
-			_, err := txn.Get([]byte(messageID))
-			if err != badger.ErrKeyNotFound {
-				toRemoveMessageIndexesSet[idx] = struct{}{}
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		panic(err)
-	}
-	toRemoveMessageIndexes := make([]int, 0, len(toRemoveMessageIndexesSet))
-	for k := range toRemoveMessageIndexesSet {
-		toRemoveMessageIndexes = append(toRemoveMessageIndexes, k)
-	}
-
-	sort.Ints(toRemoveMessageIndexes)
-	return toRemoveMessageIndexes
+	// Close closes the deduplication service
+	Close()
 }

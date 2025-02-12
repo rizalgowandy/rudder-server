@@ -6,22 +6,25 @@ import (
 	"strings"
 
 	"github.com/tidwall/gjson"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
 )
 
-//ResponseHandlerI - handle destination response
-type ResponseHandlerI interface {
+// ResponseHandler - handle destination response
+type ResponseHandler interface {
 	IsSuccessStatus(respCode int, respBody string) (returnCode int)
 }
 
-//JSONResponseHandler handler for json response
-type JSONResponseHandler struct {
+// jsonResponseHandler handler for json response
+type jsonResponseHandler struct {
+	logger         logger.Logger
 	abortRules     []map[string]interface{}
 	retryableRules []map[string]interface{}
 	throttledRules []map[string]interface{}
 }
 
-//TXTResponseHandler handler for text response
-type TXTResponseHandler struct {
+// txtResponseHandler handler for text response
+type txtResponseHandler struct {
 	abortRules     []map[string]interface{}
 	retryableRules []map[string]interface{}
 	throttledRules []map[string]interface{}
@@ -43,8 +46,8 @@ func getRulesArrForKey(key string, rules map[string]interface{}) []map[string]in
 	return rulesArr
 }
 
-//New returns a destination response handler. Can be nil(Check before using this)
-func New(responseRules map[string]interface{}) ResponseHandlerI {
+// NewResponseHandler returns a destination response handler. Can be nil(Check before using this)
+func NewResponseHandler(logger logger.Logger, responseRules map[string]interface{}) ResponseHandler {
 	if responseType, ok := responseRules["responseType"]; !ok || reflect.TypeOf(responseType).Kind() != reflect.String {
 		return nil
 	}
@@ -64,9 +67,9 @@ func New(responseRules map[string]interface{}) ResponseHandlerI {
 	throttledRules := getRulesArrForKey("throttled", rules)
 
 	if responseRules["responseType"].(string) == "JSON" {
-		return &JSONResponseHandler{abortRules: abortRules, retryableRules: retryableRules, throttledRules: throttledRules}
+		return &jsonResponseHandler{logger: logger.Child("jsonResponseHandler"), abortRules: abortRules, retryableRules: retryableRules, throttledRules: throttledRules}
 	} else if responseRules["responseType"].(string) == "TXT" {
-		return &TXTResponseHandler{abortRules: abortRules, retryableRules: retryableRules, throttledRules: throttledRules}
+		return &txtResponseHandler{abortRules: abortRules, retryableRules: retryableRules, throttledRules: throttledRules}
 	}
 
 	return nil
@@ -105,56 +108,48 @@ func evalBody(body string, rules []map[string]interface{}) bool {
 
 		if brokeOutOfLoop {
 			continue
-		} else {
-			return true
 		}
+		return true
 	}
 
 	return false
 }
 
-//JSONResponseHandler -- start
+// JSONResponseHandler -- start
 
-//IsSuccessStatus - returns the status code based on the response code and body
-func (handler *JSONResponseHandler) IsSuccessStatus(respCode int, respBody string) (returnCode int) {
+// IsSuccessStatus - returns the status code based on the response code and body
+func (handler *jsonResponseHandler) IsSuccessStatus(respCode int, respBody string) (returnCode int) {
 	defer func() {
 		if r := recover(); r != nil {
-			pkgLogger.Error(r)
+			handler.logger.Error(r)
 			returnCode = respCode
 		}
 	}()
 
-	//If it is not a 2xx, we don't need to look at the respBody, returning respCode
+	// If it is not a 2xx, we don't need to look at the respBody, returning respCode
 	if !isSuccessStatus(respCode) {
 		return respCode
 	}
 
 	if evalBody(respBody, handler.abortRules) {
-		return 400 //Rudder abort code
+		return 400 // Rudder abort code
 	}
 
 	if evalBody(respBody, handler.retryableRules) {
-		return 500 //Rudder retry code
+		return 500 // Rudder retry code
 	}
 
 	if evalBody(respBody, handler.throttledRules) {
-		return 429 //Rudder throttle code
+		return 429 // Rudder throttle code
 	}
 
 	return respCode
 }
 
-//TXTResponseHandler -- start
+// TXTResponseHandler -- start
 
-//IsSuccessStatus - returns the status code based on the response code and body
-func (handler *TXTResponseHandler) IsSuccessStatus(respCode int, respBody string) (returnCode int) {
-	defer func() {
-		if r := recover(); r != nil {
-			pkgLogger.Error(r)
-			returnCode = respCode
-		}
-	}()
-
+// IsSuccessStatus - returns the status code based on the response code and body
+func (*txtResponseHandler) IsSuccessStatus(respCode int, _ string) (returnCode int) {
 	returnCode = respCode
-	return returnCode
+	return
 }

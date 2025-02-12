@@ -3,12 +3,12 @@ package jobsdb
 import (
 	"fmt"
 
-	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-server/jobsdb/internal/lock"
 	migrator "github.com/rudderlabs/rudder-server/services/sql-migrator"
 )
 
 // SchemaMigrationTable returns the table name used for storing current schema version.
-func (jd *HandleT) SchemaMigrationTable() string {
+func (jd *Handle) SchemaMigrationTable() string {
 	return fmt.Sprintf("%s_schema_migrations", jd.tablePrefix)
 }
 
@@ -17,50 +17,40 @@ func (jd *HandleT) SchemaMigrationTable() string {
 // The following data are passed to JobsDB migration templates:
 // - Prefix: The table prefix used by this jobsdb instance.
 // - Datasets: Array of existing dataset indices.
-// If clearAll is set to true, all existing jobsdb tables will be removed first.
-func (jd *HandleT) setupDatabaseTables(clearAll bool) {
-	if clearAll {
-		jd.dropDatabaseTables()
-	}
-
-	// collect all existing dataset indices, and create template data
-	datasets := jd.getDSList(true)
-
-	datasetIndices := make([]string, 0)
-	for _, dataset := range datasets {
-		datasetIndices = append(datasetIndices, dataset.Index)
-	}
-
-	templateData := map[string]interface{}{
-		"Prefix":   jd.tablePrefix,
-		"Datasets": datasetIndices,
-	}
-
+func (jd *Handle) setupDatabaseTables(templateData map[string]interface{}) {
 	// setup migrator with appropriate schema migrations table
 	m := &migrator.Migrator{
 		Handle:                     jd.dbHandle,
 		MigrationsTable:            jd.SchemaMigrationTable(),
-		ShouldForceSetLowerVersion: config.GetBool("SQLMigrator.forceSetLowerVersion", false),
+		ShouldForceSetLowerVersion: jd.config.GetBool("SQLMigrator.forceSetLowerVersion", true),
 	}
-
 	// execute any necessary migrations
-	err := m.MigrateFromTemplates("jobsdb", templateData)
-	if err != nil {
-		panic(fmt.Errorf("Error while migrating '%v' jobsdb tables: %w", jd.tablePrefix, err))
+	if err := m.MigrateFromTemplates("jobsdb", templateData); err != nil {
+		panic(fmt.Errorf("error while migrating '%v' jobsdb tables: %w", jd.tablePrefix, err))
 	}
 }
 
-func (jd *HandleT) dropDatabaseTables() {
+func (jd *Handle) runAlwaysChangesets(templateData map[string]interface{}) {
+	// setup migrator with appropriate schema migrations table
+	m := &migrator.Migrator{
+		Handle:          jd.dbHandle,
+		MigrationsTable: fmt.Sprintf("%s_runalways_migrations", jd.tablePrefix),
+		RunAlways:       true,
+	}
+	// execute any necessary migrations
+	if err := m.MigrateFromTemplates("jobsdb_always", templateData); err != nil {
+		panic(fmt.Errorf("error while running changesets that run always in '%s' jobsdb tables: %w", jd.tablePrefix, err))
+	}
+}
 
+func (jd *Handle) dropDatabaseTables(l lock.LockToken) {
 	jd.logger.Infof("[JobsDB:%v] Dropping all database tables", jd.tablePrefix)
 	jd.dropSchemaMigrationTables()
-	jd.dropAllDS()
+	jd.assertError(jd.dropAllDS(l))
 	jd.dropJournal()
-	jd.dropAllBackupDS()
-	jd.dropMigrationCheckpointTables()
 }
 
-func (jd *HandleT) dropSchemaMigrationTables() {
+func (jd *Handle) dropSchemaMigrationTables() {
 	sqlStatement := fmt.Sprintf(`DROP TABLE IF EXISTS %s`, jd.SchemaMigrationTable())
 	_, err := jd.dbHandle.Exec(sqlStatement)
 	jd.assertError(err)
