@@ -18,6 +18,7 @@ type ConnectionManager struct {
 	active          bool
 	url             string
 	connHandler     *ConnHandler
+	Options         []grpc.ServerOption
 }
 
 type LoggerI interface {
@@ -40,14 +41,14 @@ func (cm *ConnectionManager) Apply(url string, active bool) {
 
 	cm.url = url
 
-	if active == true && !cm.active {
+	if active && !cm.active {
 		cm.active = true
 		cm.Logger.Infof(`Connection to CP Router not active. Establishing new connection`)
 		go cm.maintainConnection()
-	} else if active == false && cm.active {
+	} else if !active && cm.active {
 		cm.active = false
 		cm.Logger.Infof(`Closing connection to CP Router`)
-		cm.closeConnection()
+		_ = cm.closeConnection()
 	}
 }
 

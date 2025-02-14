@@ -5,6 +5,11 @@ test_patterns = [
     "tests/**"
 ]
 
+exclude_patterns = [
+  "**/mock_*.go",
+  "**/*.pb.go"
+]
+
 [[analyzers]]
 name = "go"
 enabled = true
@@ -12,11 +17,3 @@ enabled = true
   [analyzers.meta]
   import_paths = ["github.com/rudderlabs/rudder-server"]
 
-[[analyzers]]
-name = "javascript"
-enabled = true
-
-  [analyzers.meta]
-  plugins = ["react"]
-  dialect = "typescript"
-  environment = ["browser"]

@@ -1,51 +1,66 @@
 package misc
 
 import (
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
 	"github.com/araddon/dateparse"
 	"github.com/cenkalti/backoff"
-	"github.com/hashicorp/go-retryablehttp"
-	"github.com/mkmik/multierror"
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/utils/logger"
-	uuid "github.com/satori/go.uuid"
+	"github.com/google/uuid"
 	"github.com/tidwall/sjson"
 
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+
+	"github.com/rudderlabs/rudder-server/utils/httputil"
 	"github.com/rudderlabs/rudder-server/utils/types"
-	"github.com/thoas/go-funk"
 )
 
-var AppStartTime int64
-var errorStorePath string
+var (
+	reservedFolderPaths []*RFP
+
+	regexGwHa               = regexp.MustCompile(`^.*-gw-ha-\d+-\w+-\w+$`)
+	regexGwNonHaOrProcessor = regexp.MustCompile(`^.*-\d+$`)
+)
 
 const (
 	// RFC3339Milli with milli sec precision
-	RFC3339Milli = "2006-01-02T15:04:05.000Z07:00"
+	RFC3339Milli          = "2006-01-02T15:04:05.000Z07:00"
+	NOTIMEZONEFORMATPARSE = "2006-01-02T15:04:05"
+)
+
+const (
+	RudderAsyncDestinationLogs    = "rudder-async-destination-logs"
+	RudderArchives                = "rudder-archives"
+	RudderWarehouseStagingUploads = "rudder-warehouse-staging-uploads"
+	RudderRawDataDestinationLogs  = "rudder-raw-data-destination-logs"
+	RudderWarehouseLoadUploadsTmp = "rudder-warehouse-load-uploads-tmp"
+	RudderIdentityMergeRulesTmp   = "rudder-identity-merge-rules-tmp"
+	RudderIdentityMappingsTmp     = "rudder-identity-mappings-tmp"
+	RudderRedshiftManifests       = "rudder-redshift-manifests"
+	RudderWarehouseJsonUploadsTmp = "rudder-warehouse-json-uploads-tmp"
+	RudderTestPayload             = "rudder-test-payload"
 )
 
 // ErrorStoreT : DS to store the app errors
@@ -53,7 +68,7 @@ type ErrorStoreT struct {
 	Errors []RudderError
 }
 
-//RudderError : to store rudder error
+// RudderError : to store rudder error
 type RudderError struct {
 	StartTime         int64
 	CrashTime         int64
@@ -64,106 +79,41 @@ type RudderError struct {
 	Code              int
 }
 
-var pkgLogger logger.LoggerI
+type RFP struct {
+	path         string
+	levelsToKeep int
+}
+
+var pkgLogger logger.Logger
+
+func init() {
+	uuid.EnableRandPool()
+}
 
 func Init() {
 	pkgLogger = logger.NewLogger().Child("utils").Child("misc")
-	config.RegisterStringConfigVariable("/tmp/error_store.json", &errorStorePath, false, "recovery.errorStorePath")
+	reservedFolderPaths = GetReservedFolderPaths()
 }
 
-func getErrorStore() (ErrorStoreT, error) {
-	var errorStore ErrorStoreT
-	data, err := ioutil.ReadFile(errorStorePath)
-	if os.IsNotExist(err) {
-		defaultErrorStoreJSON := "{\"Errors\":[]}"
-		data = []byte(defaultErrorStoreJSON)
-	} else if err != nil {
-		pkgLogger.Fatal("Failed to get ErrorStore", err)
-		return errorStore, err
-	}
-
-	err = json.Unmarshal(data, &errorStore)
-	if err != nil {
-		pkgLogger.Errorf("Failed to Unmarshall %s. Error:  %v", errorStorePath, err)
-		if renameErr := os.Rename(errorStorePath, fmt.Sprintf("%s.bkp", errorStorePath)); renameErr != nil {
-			pkgLogger.Errorf("Failed to back up: %s. Error: %v", errorStorePath, err)
-		}
-		errorStore = ErrorStoreT{Errors: []RudderError{}}
-	}
-	return errorStore, nil
-}
-
-func saveErrorStore(errorStore ErrorStoreT) {
-	errorStoreJSON, err := json.MarshalIndent(&errorStore, "", " ")
-	if err != nil {
-		pkgLogger.Fatal("failed to marshal errorStore", errorStore)
-		return
-	}
-	err = ioutil.WriteFile(errorStorePath, errorStoreJSON, 0644)
-	if err != nil {
-		pkgLogger.Fatal("failed to write to errorStore")
-	}
-}
-
-//AppendError creates or appends second error to first error
-func AppendError(callingMethodName string, firstError *error, secondError *error) {
-	if *firstError != nil {
-		*firstError = fmt.Errorf("%v ; %v : %w", (*firstError).Error(), callingMethodName, *secondError)
-	} else {
-		*firstError = fmt.Errorf("%v : %w", callingMethodName, *secondError)
-	}
-}
-
-//RecordAppError appends the error occured to error_store.json
-func RecordAppError(err error) {
-	if err == nil {
-		return
-	}
-
-	if AppStartTime == 0 {
-		return
-	}
-
-	byteArr := make([]byte, 2048) // adjust buffer size to be larger than expected stack
-	n := runtime.Stack(byteArr, false)
-	stackTrace := string(byteArr[:n])
-
-	errorStore, localErr := getErrorStore()
-	if localErr != nil || errorStore.Errors == nil {
-		return
-	}
-
-	crashTime := time.Now().Unix()
-
-	//TODO Code is hardcoded now. When we introduce rudder error codes, we can use them.
-	errorStore.Errors = append(errorStore.Errors,
-		RudderError{
-			StartTime:         AppStartTime,
-			CrashTime:         crashTime,
-			ReadableStartTime: fmt.Sprint(time.Unix(AppStartTime, 0)),
-			ReadableCrashTime: fmt.Sprint(time.Unix(crashTime, 0)),
-			Message:           err.Error(),
-			StackTrace:        stackTrace,
-			Code:              101,
-		})
-	saveErrorStore(errorStore)
+func BatchDestinations() []string {
+	batchDestinations := []string{"S3", "GCS", "MINIO", "RS", "BQ", "AZURE_BLOB", "SNOWFLAKE", "POSTGRES", "CLICKHOUSE", "DIGITAL_OCEAN_SPACES", "MSSQL", "AZURE_SYNAPSE", "S3_DATALAKE", "MARKETO_BULK_UPLOAD", "GCS_DATALAKE", "AZURE_DATALAKE", "DELTALAKE", "BINGADS_AUDIENCE", "ELOQUA", "YANDEX_METRICA_OFFLINE_EVENTS", "SFTP", "BINGADS_OFFLINE_CONVERSIONS", "KLAVIYO_BULK_UPLOAD", "LYTICS_BULK_UPLOAD", "SNOWPIPE_STREAMING"}
+	return batchDestinations
 }
 
 func GetHash(s string) int {
 	h := fnv.New32a()
-	h.Write([]byte(s))
+	_, _ = h.Write([]byte(s))
 	return int(h.Sum32())
 }
 
-//GetMD5Hash returns EncodeToString(md5 hash of the input string)
+// GetMD5Hash returns EncodeToString(md5 hash of the input string)
 func GetMD5Hash(input string) string {
-	hash := md5.Sum([]byte(input))
+	hash := md5.Sum([]byte(input)) // skipcq: GO-S1023
 	return hex.EncodeToString(hash[:])
 }
 
-//GetRudderEventVal returns the value corresponding to the key in the message structure
+// GetRudderEventVal returns the value corresponding to the key in the message structure
 func GetRudderEventVal(key string, rudderEvent types.SingularEventT) (interface{}, bool) {
-
 	rudderVal, ok := rudderEvent[key]
 	if !ok {
 		return nil, false
@@ -171,147 +121,112 @@ func GetRudderEventVal(key string, rudderEvent types.SingularEventT) (interface{
 	return rudderVal, true
 }
 
-//ParseRudderEventBatch looks for the batch structure inside event
-func ParseRudderEventBatch(eventPayload json.RawMessage) ([]types.SingularEventT, bool) {
-	var gatewayBatchEvent types.GatewayBatchRequestT
-	err := json.Unmarshal(eventPayload, &gatewayBatchEvent)
-	if err != nil {
-		pkgLogger.Debug("json parsing of event payload failed ", string(eventPayload))
-		return nil, false
+// RemoveFilePaths removes filePaths as well as cleans up the empty folder structure.
+func RemoveFilePaths(filePaths ...string) {
+	for _, fp := range filePaths {
+		err := os.Remove(fp)
+		if err != nil {
+			pkgLogger.Error(err)
+		}
+		RemoveEmptyFolderStructureForFilePath(fp)
 	}
-
-	return gatewayBatchEvent.Batch, true
 }
 
-//GetRudderID return the UserID from the object
-func GetRudderID(event types.SingularEventT) (string, bool) {
-	userID, ok := GetRudderEventVal("rudderId", event)
-	if !ok {
-		//TODO: Remove this in next build.
-		//This is for backwards compatibilty, esp for those with sessions.
-		userID, ok = GetRudderEventVal("anonymousId", event)
-		if !ok {
-			return "", false
+// GetReservedFolderPaths returns all temporary folder paths.
+func GetReservedFolderPaths() []*RFP {
+	return []*RFP{
+		{path: RudderAsyncDestinationLogs, levelsToKeep: 0},
+		{path: RudderArchives, levelsToKeep: 0},
+		{path: RudderWarehouseStagingUploads, levelsToKeep: 0},
+		{path: RudderRawDataDestinationLogs, levelsToKeep: 0},
+		{path: RudderWarehouseLoadUploadsTmp, levelsToKeep: 0},
+		{path: RudderIdentityMergeRulesTmp, levelsToKeep: 1},
+		{path: RudderIdentityMappingsTmp, levelsToKeep: 1},
+		{path: RudderRedshiftManifests, levelsToKeep: 0},
+		{path: RudderWarehouseJsonUploadsTmp, levelsToKeep: 2},
+		{path: config.GetString("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", RudderTestPayload), levelsToKeep: 0},
+	}
+}
+
+func checkMatch(currDir string) bool {
+	for _, rfp := range reservedFolderPaths {
+		if ok, err := rfp.matches(currDir); err == nil && ok {
+			return true
 		}
 	}
-	userIDStr, ok := userID.(string)
-	return userIDStr, ok
+	return false
 }
 
-// ZipFiles compresses files[] into zip at filename
-func ZipFiles(filename string, files []string) error {
+func (r *RFP) matches(currDir string) (match bool, err error) {
+	var tmpDirPath string
+	tmpDirPath, err = CreateTMPDIR()
+	if err != nil {
+		return
+	}
 
-	newZipFile, err := os.Create(filename)
+	splits := strings.Split(currDir, "/")
+	if len(splits) < r.levelsToKeep {
+		return
+	}
+	join := strings.Join(splits[0:len(splits)-r.levelsToKeep], "/")
+	match = fmt.Sprintf("%s/%s", tmpDirPath, r.path) == join
+	return
+}
+
+// RemoveContents removes all the contents of the directory
+func RemoveContents(dir string) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	defer newZipFile.Close()
-
-	zipWriter := zip.NewWriter(newZipFile)
-	defer zipWriter.Close()
-
-	// Add files to zip
-	for _, file := range files {
-		if err = AddFileToZip(zipWriter, file); err != nil {
+	defer d.Close()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		err = os.RemoveAll(filepath.Join(dir, name))
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// AddFileToZip adds file to zip including size header stats
-func AddFileToZip(zipWriter *zip.Writer, filename string) error {
-
-	fileToZip, err := os.Open(filename)
-	if err != nil {
-		return err
+// RemoveEmptyFolderStructureForFilePath recursively cleans up everything till it reaches the stage where the folders are not empty or parent.
+func RemoveEmptyFolderStructureForFilePath(fp string) {
+	if fp == "" {
+		return
 	}
-	defer fileToZip.Close()
-
-	// Get the file information
-	info, err := fileToZip.Stat()
-	if err != nil {
-		panic(err)
-	}
-
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		panic(err)
-	}
-
-	// Using FileInfoHeader() above only uses the basename of the file. If we want
-	// to preserve the folder structure we can overwrite this with the full path.
-	// uncomment this line to preserve folder structure
-	// header.Name = filename
-
-	// Change to deflate to gain better compression
-	// see http://golang.org/pkg/archive/zip/#pkg-constants
-	header.Method = zip.Deflate
-
-	writer, err := zipWriter.CreateHeader(header)
-	if err != nil {
-		panic(err)
-	}
-	_, err = io.Copy(writer, fileToZip)
-	return err
-}
-
-// UnZipSingleFile unzips zip containing single file into ouputfile path passed
-func UnZipSingleFile(outputfile string, filename string) {
-	r, err := zip.OpenReader(filename)
-	if err != nil {
-		panic(err)
-	}
-	defer r.Close()
-	inputfile := r.File[0]
-	// Make File
-	os.MkdirAll(filepath.Dir(outputfile), os.ModePerm)
-	outFile, err := os.OpenFile(outputfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, inputfile.Mode())
-	if err != nil {
-		panic(err)
-	}
-	rc, _ := inputfile.Open()
-	io.Copy(outFile, rc)
-	outFile.Close()
-	rc.Close()
-}
-
-func RemoveFilePaths(filepaths ...string) {
-	for _, filepath := range filepaths {
-		err := os.Remove(filepath)
-		if err != nil {
-			pkgLogger.Error(err)
+	for currDir := filepath.Dir(fp); currDir != "/" && currDir != "."; {
+		// Checking if the currDir is present in the temporary folders or not
+		// If present we should stop at that point.
+		if checkMatch(currDir) {
+			break
 		}
+		parentDir := filepath.Dir(currDir)
+		err := syscall.Rmdir(currDir)
+		if err != nil {
+			break
+		}
+		currDir = parentDir
 	}
 }
 
-// ReadLines reads a whole file into memory
-// and returns a slice of its lines.
-func ReadLines(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	return lines, scanner.Err()
-}
+var logOnce sync.Once
 
 // CreateTMPDIR creates tmp dir at path configured via RUDDER_TMPDIR env var
 func CreateTMPDIR() (string, error) {
-	tmpdirPath := strings.TrimSuffix(config.GetEnv("RUDDER_TMPDIR", ""), "/")
+	tmpdirPath := strings.TrimSuffix(config.GetString("RUDDER_TMPDIR", ""), "/")
 	// second chance: fallback to /tmp if this folder exists
 	if tmpdirPath == "" {
 		fallbackPath := "/tmp"
 		_, err := os.Stat(fallbackPath)
 		if err == nil {
 			tmpdirPath = fallbackPath
-			pkgLogger.Infof("RUDDER_TMPDIR not found, falling back to %v\n", fallbackPath)
+			logOnce.Do(func() {
+				fmt.Printf("RUDDER_TMPDIR not found, falling back to %v\n", fallbackPath)
+			})
 		}
 	}
 	if tmpdirPath == "" {
@@ -320,65 +235,8 @@ func CreateTMPDIR() (string, error) {
 	return tmpdirPath, nil
 }
 
-//PerfStats is the class for managing performance stats. Not multi-threaded safe now
-type PerfStats struct {
-	eventCount           int64
-	elapsedTime          time.Duration
-	lastPrintEventCount  int64
-	lastPrintElapsedTime time.Duration
-	lastPrintTime        time.Time
-	compStr              string
-	tmpStart             time.Time
-	instantRateCall      float64
-	printThres           int
-}
-
-//Setup initializes the stat collector
-func (stats *PerfStats) Setup(comp string) {
-	stats.compStr = comp
-	stats.lastPrintTime = time.Now()
-	stats.printThres = 5 //seconds
-}
-
-//Start marks the start of event collection
-func (stats *PerfStats) Start() {
-	stats.tmpStart = time.Now()
-}
-
-//End marks the end of one round of stat collection. events is number of events processed since start
-func (stats *PerfStats) End(events int) {
-	elapsed := time.Since(stats.tmpStart)
-	stats.elapsedTime += elapsed
-	stats.eventCount += int64(events)
-	stats.instantRateCall = float64(events) * float64(time.Second) / float64(elapsed)
-}
-
-//Print displays the stats
-func (stats *PerfStats) Print() {
-	if time.Since(stats.lastPrintTime) > time.Duration(stats.printThres)*time.Second {
-		overallRate := float64(stats.eventCount) * float64(time.Second) / float64(stats.elapsedTime)
-		instantRate := float64(stats.eventCount-stats.lastPrintEventCount) * float64(time.Second) / float64(stats.elapsedTime-stats.lastPrintElapsedTime)
-		pkgLogger.Infof("%s: Total: %d Overall:%f, Instant(print):%f, Instant(call):%f",
-			stats.compStr, stats.eventCount, overallRate, instantRate, stats.instantRateCall)
-		stats.lastPrintEventCount = stats.eventCount
-		stats.lastPrintElapsedTime = stats.elapsedTime
-		stats.lastPrintTime = time.Now()
-	}
-}
-
-func (stats *PerfStats) Status() map[string]interface{} {
-	overallRate := float64(0)
-	if float64(stats.elapsedTime) > 0 {
-		overallRate = float64(stats.eventCount) * float64(time.Second) / float64(stats.elapsedTime)
-	}
-	return map[string]interface{}{
-		"total-events": stats.eventCount,
-		"overall-rate": overallRate,
-	}
-}
-
-//Copy copies the exported fields from src to dest
-//Used for copying the default transport
+// Copy copies the exported fields from src to dest
+// Used for copying the default transport
 func Copy(dst, src interface{}) {
 	srcV := reflect.ValueOf(src)
 	dstV := reflect.ValueOf(dst)
@@ -416,91 +274,10 @@ func Copy(dst, src interface{}) {
 	}
 }
 
-// GetIPFromReq gets ip address from request
-func GetIPFromReq(req *http.Request) string {
-	addresses := strings.Split(req.Header.Get("X-Forwarded-For"), ",")
-	if addresses[0] == "" {
-		splits := strings.Split(req.RemoteAddr, ":")
-		pkgLogger.Debugf("%#v", req)
-		return strings.Join(splits[:len(splits)-1], ":") // When there is no load-balancer
-	}
-
-	return strings.Replace(addresses[0], " ", "", -1)
-}
-
-func ContainsString(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
-func equal(expected, actual interface{}) bool {
-	if expected == nil || actual == nil {
-		return expected == actual
-	}
-	return reflect.DeepEqual(expected, actual)
-}
-
-// Contains returns true if an element is present in a iteratee.
-// https://github.com/thoas/go-funk
-func Contains(in interface{}, elem interface{}) bool {
-	inValue := reflect.ValueOf(in)
-	elemValue := reflect.ValueOf(elem)
-	inType := inValue.Type()
-
-	switch inType.Kind() {
-	case reflect.String:
-		return strings.Contains(inValue.String(), elemValue.String())
-	case reflect.Map:
-		for _, key := range inValue.MapKeys() {
-			if equal(key.Interface(), elem) {
-				return true
-			}
-		}
-	case reflect.Slice, reflect.Array:
-		for i := 0; i < inValue.Len(); i++ {
-			if equal(inValue.Index(i).Interface(), elem) {
-				return true
-			}
-		}
-	default:
-		panic(fmt.Errorf("Type %s is not supported by Contains, supported types are String, Map, Slice, Array", inType.String()))
-	}
-
-	return false
-}
-
-// IncrementMapByKey starts with 1 and increments the counter of a key
-func IncrementMapByKey(m map[string]int, key string, increment int) {
-	_, found := m[key]
-	if found {
-		m[key] = m[key] + increment
-	} else {
-		m[key] = increment
-	}
-}
-
-// Returns chronological timestamp of the event using the formula
-// timestamp = receivedAt - (sentAt - originalTimestamp)
+//  Returns chronological timestamp of the event using the formula
+//  timestamp = receivedAt - (sentAt - originalTimestamp)
 func GetChronologicalTimeStamp(receivedAt, sentAt, originalTimestamp time.Time) time.Time {
 	return receivedAt.Add(-sentAt.Sub(originalTimestamp))
-}
-
-func StringKeys(input interface{}) []string {
-	keys := funk.Keys(input)
-	stringKeys := keys.([]string)
-	return stringKeys
-}
-
-func MapStringKeys(input map[string]interface{}) []string {
-	keys := make([]string, 0, len(input))
-	for k := range input {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 func TruncateStr(str string, limit int) string {
@@ -516,41 +293,6 @@ func TailTruncateStr(str string, count int) string {
 		str = str[len(str)-count:]
 	}
 	return str
-}
-
-func SortedMapKeys(input interface{}) []string {
-	inValue := reflect.ValueOf(input)
-	mapKeys := inValue.MapKeys()
-	keys := make([]string, 0, len(mapKeys))
-	for _, key := range mapKeys {
-		keys = append(keys, key.String())
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func SortedStructSliceValues(input interface{}, filedName string) []string {
-	items := reflect.ValueOf(input)
-	var keys []string
-	if items.Kind() == reflect.Slice {
-		for i := 0; i < items.Len(); i++ {
-			item := items.Index(i)
-			if item.Kind() == reflect.Struct {
-				v := reflect.Indirect(item)
-				for j := 0; j < v.NumField(); j++ {
-					if v.Type().Field(j).Name == "Name" {
-						keys = append(keys, v.Field(j).String())
-					}
-				}
-			}
-		}
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func bToMb(b uint64) uint64 {
-	return b / 1024 / 1024
 }
 
 func ReplaceMultiRegex(str string, expList map[string]string) (string, error) {
@@ -572,7 +314,7 @@ func ConvertStringInterfaceToIntArray(interfaceT interface{}) ([]int64, error) {
 	}
 	typeInterface := reflect.TypeOf(interfaceT).Kind()
 	if !(typeInterface != reflect.Slice) && !(typeInterface != reflect.Array) {
-		return intArr, errors.New("didn't recieve array from transformer")
+		return intArr, errors.New("didn't receive array from transformer")
 	}
 
 	interfaceArray := interfaceT.([]interface{})
@@ -605,15 +347,20 @@ func MakeHTTPRequestWithTimeout(url string, payload io.Reader, timeout time.Dura
 
 	var respBody []byte
 	if resp != nil && resp.Body != nil {
-		respBody, _ = ioutil.ReadAll(resp.Body)
-		defer resp.Body.Close()
+		respBody, _ = io.ReadAll(resp.Body)
+		defer func() { httputil.CloseResponse(resp) }()
 	}
 
 	return respBody, resp.StatusCode, nil
 }
 
-func HTTPCallWithRetry(url string, payload []byte) ([]byte, int) {
-	return HTTPCallWithRetryWithTimeout(url, payload, time.Second*150)
+func ConvertInterfaceToStringArray(input []interface{}) []string {
+	output := make([]string, len(input))
+	for i, val := range input {
+		valString, _ := val.(string)
+		output[i] = valString
+	}
+	return output
 }
 
 func HTTPCallWithRetryWithTimeout(url string, payload []byte, timeout time.Duration) ([]byte, int) {
@@ -629,7 +376,6 @@ func HTTPCallWithRetryWithTimeout(url string, payload []byte, timeout time.Durat
 	err := backoff.RetryNotify(operation, backoffWithMaxRetry, func(err error, t time.Duration) {
 		pkgLogger.Errorf("Failed to make call. Error: %v, retrying after %v", err, t)
 	})
-
 	if err != nil {
 		pkgLogger.Error("Error sending request to the server", err)
 		return respBody, statusCode
@@ -638,7 +384,7 @@ func HTTPCallWithRetryWithTimeout(url string, payload []byte, timeout time.Durat
 }
 
 func IntArrayToString(a []int64, delim string) string {
-	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
+	return strings.Trim(strings.ReplaceAll(fmt.Sprint(a), " ", delim), "[]")
 }
 
 func MakeJSONArray(bytesArray [][]byte) []byte {
@@ -656,7 +402,7 @@ func MakeJSONArray(bytesArray [][]byte) []byte {
 
 func SingleQuoteLiteralJoin(slice []string) string {
 	var str string
-	//TODO: use strings.Join() instead
+	// TODO: use strings.Join() instead
 	for index, key := range slice {
 		if index > 0 {
 			str += `, `
@@ -666,27 +412,13 @@ func SingleQuoteLiteralJoin(slice []string) string {
 	return str
 }
 
-// PrintMemUsage outputs the current, total and OS memory being used. As well as the number
-// of garage collection cycles completed.
-func PrintMemUsage() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	// For info on each, see: https://golang.org/pkg/runtime/#MemStats
-	pkgLogger.Debug("#########")
-	pkgLogger.Debugf("Alloc = %v MiB\n", bToMb(m.Alloc))
-	pkgLogger.Debugf("\tTotalAlloc = %v MiB\n", bToMb(m.TotalAlloc))
-	pkgLogger.Debugf("\tSys = %v MiB\n", bToMb(m.Sys))
-	pkgLogger.Debugf("\tNumGC = %v\n", m.NumGC)
-	pkgLogger.Debug("#########")
-}
-
 type BufferedWriter struct {
 	File   *os.File
 	Writer *bufio.Writer
 }
 
 func CreateBufferedWriter(s string) (w BufferedWriter, err error) {
-	file, err := os.OpenFile(s, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0660)
+	file, err := os.OpenFile(s, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o660)
 	if err != nil {
 		return
 	}
@@ -721,7 +453,7 @@ type GZipWriter struct {
 }
 
 func CreateGZ(s string) (w GZipWriter, err error) {
-	file, err := os.OpenFile(s, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0660)
+	file, err := os.OpenFile(s, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o660)
 	if err != nil {
 		return
 	}
@@ -751,7 +483,7 @@ func (w GZipWriter) Write(b []byte) (count int, err error) {
 	return
 }
 
-func (w GZipWriter) WriteRow(row []interface{}) error {
+func (GZipWriter) WriteRow(_ []interface{}) error {
 	return errors.New("not implemented")
 }
 
@@ -828,30 +560,11 @@ func GetMacAddress() string {
 	return macAddress.String()
 }
 
-func KeepProcessAlive() {
-	var ch chan int
-	<-ch
-}
-
-// GetOutboundIP returns preferred outbound ip of this machine
-// https://stackoverflow.com/a/37382208
-func GetOutboundIP() (net.IP, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-
-	return localAddr.IP, nil
-}
-
 /*
 RunWithTimeout runs provided function f until provided timeout d.
 If the timeout is reached, onTimeout callback will be called.
 */
-func RunWithTimeout(f func(), onTimeout func(), d time.Duration) {
+func RunWithTimeout(f, onTimeout func(), d time.Duration) {
 	c := make(chan struct{})
 	go func() {
 		defer close(c)
@@ -869,12 +582,33 @@ func RunWithTimeout(f func(), onTimeout func(), d time.Duration) {
 IsValidUUID will check if provided string is a valid UUID
 */
 func IsValidUUID(uuid string) bool {
-	r := regexp.MustCompile("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-4[a-fA-F0-9]{3}-[8|9|aA|bB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$")
+	r := regexp.MustCompile("^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-4[a-fA-F0-9]{3}-[89aAbB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$")
 	return r.MatchString(uuid)
+}
+
+func FastUUID() uuid.UUID {
+	return uuid.New()
+}
+
+func HasAWSRoleARNInConfig(configMap map[string]interface{}) bool {
+	if configMap["iamRoleARN"] == nil {
+		return false
+	}
+	iamRoleARN, ok := configMap["iamRoleARN"].(string)
+	if !ok {
+		return false
+	}
+	if iamRoleARN == "" {
+		return false
+	}
+	return true
 }
 
 func HasAWSKeysInConfig(config interface{}) bool {
 	configMap := config.(map[string]interface{})
+	if configMap["useSTSTokens"] == false {
+		return false
+	}
 	if configMap["accessKeyID"] == nil || configMap["accessKey"] == nil {
 		return false
 	}
@@ -893,25 +627,25 @@ func HasAWSRegionInConfig(config interface{}) bool {
 }
 
 func GetRudderObjectStorageAccessKeys() (accessKeyID, accessKey string) {
-	return config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", ""), config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
+	return config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", ""), config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
 }
 
 func GetRudderObjectStoragePrefix() (prefix string) {
-	return config.GetEnv("RUDDER_WAREHOUSE_BUCKET_PREFIX", config.GetNamespaceIdentifier())
+	return config.GetString("RUDDER_WAREHOUSE_BUCKET_PREFIX", config.GetNamespaceIdentifier())
 }
 
 func GetRudderObjectStorageConfig(prefixOverride string) (storageConfig map[string]interface{}) {
 	// TODO: add error log if s3 keys are not available
 	storageConfig = make(map[string]interface{})
-	storageConfig["bucketName"] = config.GetEnv("RUDDER_WAREHOUSE_BUCKET", "rudder-warehouse-storage")
-	storageConfig["accessKeyID"] = config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", "")
-	storageConfig["accessKey"] = config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
-	storageConfig["enableSSE"] = config.GetEnvAsBool("RUDDER_WAREHOUSE_BUCKET_SSE", true)
+	storageConfig["bucketName"] = config.GetString("RUDDER_WAREHOUSE_BUCKET", "rudder-warehouse-storage")
+	storageConfig["accessKeyID"] = config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", "")
+	storageConfig["accessKey"] = config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
+	storageConfig["enableSSE"] = config.GetBool("RUDDER_WAREHOUSE_BUCKET_SSE", true)
 	// set prefix from override for shared slave type nodes
 	if prefixOverride != "" {
 		storageConfig["prefix"] = prefixOverride
 	} else {
-		storageConfig["prefix"] = config.GetEnv("RUDDER_WAREHOUSE_BUCKET_PREFIX", config.GetNamespaceIdentifier())
+		storageConfig["prefix"] = config.GetString("RUDDER_WAREHOUSE_BUCKET_PREFIX", config.GetNamespaceIdentifier())
 	}
 	return
 }
@@ -930,6 +664,7 @@ type ObjectStorageOptsT struct {
 	Config                      interface{}
 	UseRudderStorage            bool
 	RudderStoragePrefixOverride string
+	WorkspaceID                 string
 }
 
 func GetObjectStorageConfig(opts ObjectStorageOptsT) map[string]interface{} {
@@ -937,60 +672,20 @@ func GetObjectStorageConfig(opts ObjectStorageOptsT) map[string]interface{} {
 	if opts.UseRudderStorage {
 		return GetRudderObjectStorageConfig(opts.RudderStoragePrefixOverride)
 	}
-	if opts.Provider == "S3" && !HasAWSKeysInConfig(opts.Config) {
+	if opts.Provider == "S3" {
 		clonedObjectStorageConfig := make(map[string]interface{})
 		for k, v := range objectStorageConfigMap {
 			clonedObjectStorageConfig[k] = v
 		}
-		clonedObjectStorageConfig["accessKeyID"] = config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", "")
-		clonedObjectStorageConfig["accessKey"] = config.GetEnv("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
-		return clonedObjectStorageConfig
+		clonedObjectStorageConfig["externalID"] = opts.WorkspaceID
+		if !HasAWSRoleARNInConfig(objectStorageConfigMap) &&
+			!HasAWSKeysInConfig(objectStorageConfigMap) {
+			clonedObjectStorageConfig["accessKeyID"] = config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY_ID", "")
+			clonedObjectStorageConfig["accessKey"] = config.GetString("RUDDER_AWS_S3_COPY_USER_ACCESS_KEY", "")
+		}
+		objectStorageConfigMap = clonedObjectStorageConfig
 	}
 	return objectStorageConfigMap
-
-}
-
-func GetSpacesLocation(location string) (region string) {
-	r, _ := regexp.Compile("\\.*.*\\.digitaloceanspaces\\.com")
-	subLocation := r.FindString(location)
-	regionTokens := strings.Split(subLocation, ".")
-	if len(regionTokens) == 3 {
-		region = regionTokens[0]
-	}
-	return region
-}
-
-//GetNodeID returns the nodeId of the current node
-func GetNodeID() string {
-	nodeID := config.GetRequiredEnv("INSTANCE_ID")
-	return nodeID
-}
-
-//MakeRetryablePostRequest is Util function to make a post request.
-func MakeRetryablePostRequest(url string, endpoint string, data interface{}) (response []byte, statusCode int, err error) {
-	backendURL := fmt.Sprintf("%s%s", url, endpoint)
-	dataJSON, err := json.Marshal(data)
-
-	resp, err := retryablehttp.Post(backendURL, "application/json", dataJSON)
-
-	if err != nil {
-		return nil, -1, err
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
-
-	pkgLogger.Debugf("Post request: Successful %s", string(body))
-	return body, resp.StatusCode, nil
-}
-
-//GetMD5UUID hashes the given string into md5 and returns it as auuid
-func GetMD5UUID(str string) (uuid.UUID, error) {
-	md5Sum := md5.Sum([]byte(str))
-	u, err := uuid.FromBytes(md5Sum[:])
-	u.SetVersion(uuid.V4)
-	u.SetVariant(uuid.VariantRFC4122)
-	return u, err
 }
 
 // GetParsedTimestamp returns the parsed timestamp
@@ -1031,7 +726,7 @@ func parseTag(tag string) (string, string) {
 	return tag, ""
 }
 
-//GetMandatoryJSONFieldNames returns all the json field names defined against the json tag for each field.
+// GetMandatoryJSONFieldNames returns all the json field names defined against the json tag for each field.
 func GetMandatoryJSONFieldNames(st interface{}) []string {
 	v := reflect.TypeOf(st)
 	mandatoryJSONFieldNames := make([]string, 0, v.NumField())
@@ -1051,14 +746,7 @@ func GetMandatoryJSONFieldNames(st interface{}) []string {
 	return mandatoryJSONFieldNames
 }
 
-func MinInt(a, b int) int {
-	if a <= b {
-		return a
-	}
-	return b
-}
-
-//GetTagName gets the tag name using a uuid and name
+// GetTagName gets the tag name using a uuid and name
 func GetTagName(id string, names ...string) string {
 	var truncatedNames string
 	for _, name := range names {
@@ -1068,7 +756,7 @@ func GetTagName(id string, names ...string) string {
 	return truncatedNames + TailTruncateStr(id, 6)
 }
 
-//UpdateJSONWithNewKeyVal enhances the json passed with key, val
+// UpdateJSONWithNewKeyVal enhances the json passed with key, val
 func UpdateJSONWithNewKeyVal(params []byte, key string, val interface{}) []byte {
 	updatedParams, err := sjson.SetBytes(params, key, val)
 	if err != nil {
@@ -1087,38 +775,22 @@ func ConcatErrors(givenErrors []error) error {
 		}
 		errorsToJoin = append(errorsToJoin, err)
 	}
-	return multierror.Join(errorsToJoin)
+	return errors.Join(errorsToJoin...)
 }
 
 func isWarehouseMasterEnabled() bool {
 	warehouseMode := config.GetString("Warehouse.mode", "embedded")
 	return warehouseMode == config.EmbeddedMode ||
-		warehouseMode == config.PooledWHSlaveMode
+		warehouseMode == config.EmbeddedMasterMode
 }
 
 func GetWarehouseURL() (url string) {
 	if isWarehouseMasterEnabled() {
 		url = fmt.Sprintf(`http://localhost:%d`, config.GetInt("Warehouse.webPort", 8082))
 	} else {
-		url = config.GetEnv("WAREHOUSE_URL", "http://localhost:8082")
+		url = config.GetString("WAREHOUSE_URL", "http://localhost:8082")
 	}
 	return
-}
-
-func GetStringifiedData(data interface{}) string {
-	if data == nil {
-		return ""
-	}
-	switch d := data.(type) {
-	case string:
-		return d
-	default:
-		dataBytes, err := json.Marshal(d)
-		if err != nil {
-			return fmt.Sprint(d)
-		}
-		return string(dataBytes)
-	}
 }
 
 // MergeMaps merging with one level of nesting.
@@ -1130,4 +802,166 @@ func MergeMaps(maps ...map[string]interface{}) map[string]interface{} {
 		}
 	}
 	return result
+}
+
+type MapLookupError struct {
+	SearchKey string // indicates the searchkey which is not present in the map
+	Err       error  // contains the error occurred string while looking up the key in the map
+	Level     int    // indicates the nesting level at which error has occurred
+}
+
+func (e *MapLookupError) Error() string {
+	return e.Err.Error()
+}
+
+// NestedMapLookup
+// m:  a map from strings to other maps or values, of arbitrary depth
+// ks: successive keys to reach an internal or leaf node (variadic)
+// If an internal node is reached, will return the internal map
+//
+// Returns: (Exactly one of these will be nil)
+// rval: the target node (if found)
+// err:  an error created by fmt.Errorf
+func NestedMapLookup(m map[string]interface{}, ks ...string) (interface{}, *MapLookupError) {
+	var lookupWithLevel func(map[string]interface{}, int, ...string) (interface{}, *MapLookupError)
+
+	lookupWithLevel = func(searchMap map[string]interface{}, level int, keys ...string) (rval interface{}, err *MapLookupError) {
+		var ok bool
+		if len(keys) == 0 { // degenerate input
+			return nil, &MapLookupError{Err: fmt.Errorf("NestedMapLookup needs at least one key"), Level: level}
+		}
+		if rval, ok = searchMap[keys[0]]; !ok {
+			return nil, &MapLookupError{Err: fmt.Errorf("key: %v not found", keys[0]), SearchKey: keys[0], Level: level}
+		} else if len(keys) == 1 { // we've reached the final key
+			return rval, nil
+		} else if searchMap, ok = rval.(map[string]interface{}); !ok {
+			return nil, &MapLookupError{Err: fmt.Errorf("malformed structure at %#v", rval), SearchKey: keys[0], Level: level}
+		}
+		// 1+ more keys
+		level += 1
+		return lookupWithLevel(searchMap, level, keys[1:]...)
+	}
+	return lookupWithLevel(m, 0, ks...)
+}
+
+// SleepCtx sleeps for the given duration or until the context is canceled.
+//
+//	the context error is returned if context is canceled.
+func SleepCtx(ctx context.Context, delay time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+		return nil
+	}
+}
+
+func Unique(stringSlice []string) []string {
+	keys := make(map[string]struct{})
+	var list []string
+	for _, entry := range stringSlice {
+		if _, ok := keys[entry]; !ok {
+			keys[entry] = struct{}{}
+			list = append(list, entry)
+		}
+	}
+	return list
+}
+
+// MapLookup returns the value of the key in the map, or nil if the key is not present.
+//
+// If multiple keys are provided then it looks for nested maps recursively.
+func MapLookup(mapToLookup map[string]interface{}, keys ...string) interface{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	if val, ok := mapToLookup[keys[0]]; ok {
+		if len(keys) == 1 {
+			return val
+		}
+		nextMap, ok := val.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		return MapLookup(nextMap, keys[1:]...)
+	}
+	return nil
+}
+
+func CopyStringMap(originalMap map[string]string) map[string]string {
+	newMap := make(map[string]string)
+	for key, value := range originalMap {
+		newMap[key] = value
+	}
+	return newMap
+}
+
+func GetDiskUsageOfFile(path string) (int64, error) {
+	// Notes
+	// 1. stat.Blocks is the number of stat.Blksize blocks allocated to the file
+	// 2. stat.Blksize is the filesystem block size for this filesystem
+	// 3. We compute the actual disk usage of a (sparse) file by multiplying the number of blocks allocated to the file with the block size. This computes a different value than the one returned by stat.Size particularly for sparse files.
+	var stat syscall.Stat_t
+	err := syscall.Stat(path, &stat)
+	if err != nil {
+		return 0, fmt.Errorf("unable to get file size %w", err)
+	}
+	return int64(stat.Blksize) * stat.Blocks / 8, nil //nolint:unconvert // In amd64 architecture stat.Blksize is int64 whereas in arm64 it is int32
+}
+
+// DiskUsage calculates the path's disk usage recursively in bytes. If exts are provided, only files with matching extensions will be included in the result.
+func DiskUsage(path string, ext ...string) (int64, error) {
+	var totSize int64
+	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		size, _ := GetDiskUsageOfFile(path)
+		if len(ext) == 0 {
+			totSize += size
+		} else {
+			for _, e := range ext {
+				if filepath.Ext(path) == e {
+					totSize += size
+				}
+			}
+		}
+		return nil
+	})
+	return totSize, err
+}
+
+func GetBadgerDBUsage(dir string) (int64, int64, int64, error) {
+	// Notes
+	// Instead of using BadgerDB's internal function to get the disk usage, we are writing our own implementation because of the following reasons:
+	// 1. BadgerDB internally creates a sparse memory backed file to store the data
+	// 2. The size returned by the filepath.Walk used internally gives a misleading size because the file is mostly empty and doesn't consume any disk space
+	lsmSize, err := DiskUsage(dir, ".sst")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	vlogSize, err := DiskUsage(dir, ".vlog")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	totSize, err := DiskUsage(dir)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return lsmSize, vlogSize, totSize, nil
+}
+
+func GetInstanceID() string {
+	instance := config.GetString("INSTANCE_ID", "")
+	instanceArr := strings.Split(instance, "-")
+	length := len(instanceArr)
+	// This handles 2 kinds of server instances
+	// a) Processor OR Gateway running in non HA mod where the instance name ends with the index
+	// b) Gateway running in HA mode, where the instance name is of the form *-gw-ha-<index>-<statefulset-id>-<pod-id>
+	if (regexGwHa.MatchString(instance)) && (length > 3) {
+		return instanceArr[length-3]
+	} else if (regexGwNonHaOrProcessor.MatchString(instance)) && (length > 1) {
+		return instanceArr[length-1]
+	}
+	return ""
 }

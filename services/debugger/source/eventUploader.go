@@ -1,102 +1,193 @@
 package sourcedebugger
 
+//go:generate mockgen -destination=./mocks/mock.go -package=mocks github.com/rudderlabs/rudder-server/services/debugger/source SourceDebugger
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stringify"
+
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/rruntime"
 	"github.com/rudderlabs/rudder-server/services/debugger"
-	"github.com/rudderlabs/rudder-server/utils"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-server/services/debugger/cache"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
-//GatewayEventBatchT is a structure to hold batch of events
+// GatewayEventBatchT is a structure to hold batch of events
 type GatewayEventBatchT struct {
-	writeKey   string
-	eventBatch string
+	WriteKey   string
+	EventBatch []byte
 }
 
-//EventUploadT is a structure to hold actual event data
+// EventUploadT is a structure to hold actual event data
 type EventUploadT map[string]interface{}
 
-//EventUploadBatchT is a structure to hold batch of events
+// EventUploadBatchT is a structure to hold batch of events
 type EventUploadBatchT struct {
 	WriteKey   string
 	ReceivedAt string
 	Batch      []EventUploadT
 }
 
-var uploadEnabledWriteKeys []string
-var configSubscriberLock sync.RWMutex
+type SourceDebugger interface {
+	RecordEvent(writeKey string, eventBatch []byte) bool
+	Stop()
+}
 
-var uploader debugger.UploaderI
-
-var (
+type Handle struct {
+	started             bool
+	uploader            debugger.Uploader[*GatewayEventBatchT]
 	configBackendURL    string
-	disableEventUploads bool
-	pkgLogger           logger.LoggerI
-)
+	disableEventUploads config.ValueLoader[bool]
+	log                 logger.Logger
+	eventsCache         cache.Cache[[]byte]
 
-func Init() {
-	loadConfig()
-	pkgLogger = logger.NewLogger().Child("debugger").Child("source")
+	uploadEnabledWriteKeysMu sync.RWMutex
+	uploadEnabledWriteKeys   []string
 
+	ctx         context.Context
+	cancel      func()
+	initialized chan struct{}
+	done        chan struct{}
 }
 
-func loadConfig() {
-	configBackendURL = config.GetEnv("CONFIG_BACKEND_URL", "https://api.rudderlabs.com")
-	config.RegisterBoolConfigVariable(false, &disableEventUploads, true, "SourceDebugger.disableEventUploads")
+func NewHandle(backendConfig backendconfig.BackendConfig) (SourceDebugger, error) {
+	h := &Handle{
+		configBackendURL: config.GetString("CONFIG_BACKEND_URL", "https://api.rudderstack.com"),
+		log:              logger.NewLogger().Child("debugger").Child("source"),
+	}
+	var err error
+	h.disableEventUploads = config.GetReloadableBoolVar(false, "SourceDebugger.disableEventUploads")
+	url := fmt.Sprintf("%s/dataplane/v2/eventUploads", h.configBackendURL)
+	eventUploader := NewEventUploader(h.log)
+	h.uploader = debugger.New[*GatewayEventBatchT](url, backendConfig.Identity(), eventUploader)
+	h.uploader.Start()
+
+	cacheType := cache.CacheType(config.GetInt("SourceDebugger.cacheType", int(cache.MemoryCacheType)))
+	h.eventsCache, err = cache.New[[]byte](cacheType, "source", h.log)
+	if err != nil {
+		return nil, err
+	}
+
+	h.start(backendConfig)
+	return h, nil
 }
 
-type EventUploader struct {
-}
-
-//Setup initializes this module
-func Setup(backendConfig backendconfig.BackendConfig) {
-	url := fmt.Sprintf("%s/dataplane/v2/eventUploads", configBackendURL)
-	eventUploader := &EventUploader{}
-	uploader = debugger.New(url, eventUploader)
-	uploader.Start()
-
+// Start initializes this module
+func (h *Handle) start(backendConfig backendconfig.BackendConfig) {
+	ctx, cancel := context.WithCancel(context.Background())
+	h.ctx = ctx
+	h.cancel = cancel
+	h.done = make(chan struct{})
+	h.initialized = make(chan struct{})
+	h.started = true
 	rruntime.Go(func() {
-		backendConfigSubscriber(backendConfig)
+		h.backendConfigSubscriber(backendConfig)
 	})
 }
 
-//RecordEvent is used to put the event batch in the eventBatchChannel,
-//which will be processed by handleEvents.
-func RecordEvent(writeKey string, eventBatch string) bool {
-	//if disableEventUploads is true, return;
-	if disableEventUploads {
+func (h *Handle) Stop() {
+	if !h.started {
+		return
+	}
+	h.cancel()
+	<-h.done
+	if h.eventsCache != nil {
+		_ = h.eventsCache.Stop()
+	}
+	h.uploader.Stop()
+	h.started = false
+}
+
+// RecordEvent is used to put the event batch in the eventBatchChannel,
+// which will be processed by handleEvents.
+func (h *Handle) RecordEvent(writeKey string, eventBatch []byte) bool {
+	if !h.started || h.disableEventUploads.Load() {
 		return false
 	}
-
+	<-h.initialized
 	// Check if writeKey part of enabled sources
-	configSubscriberLock.RLock()
-	defer configSubscriberLock.RUnlock()
-	if !misc.ContainsString(uploadEnabledWriteKeys, writeKey) {
+	h.uploadEnabledWriteKeysMu.RLock()
+	defer h.uploadEnabledWriteKeysMu.RUnlock()
+	if !slices.Contains(h.uploadEnabledWriteKeys, writeKey) {
+		err := h.eventsCache.Update(writeKey, eventBatch)
+		if err != nil {
+			h.log.Errorf("Error while updating cache: %v", err)
+		}
 		return false
 	}
-
-	uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatch})
+	h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatch})
 	return true
 }
 
-func (eventUploader *EventUploader) Transform(data interface{}) ([]byte, error) {
-	eventBuffer := data.([]interface{})
+func (h *Handle) updateConfig(config map[string]backendconfig.ConfigT) {
+	var uploadEnabledWriteKeys []string
+	for _, wConfig := range config {
+		for _, source := range wConfig.Sources {
+			if source.Config != nil {
+				if source.Enabled && source.Config["eventUpload"] == true {
+					uploadEnabledWriteKeys = append(uploadEnabledWriteKeys, source.WriteKey)
+				}
+			}
+		}
+	}
+	h.uploadEnabledWriteKeysMu.Lock()
+	h.uploadEnabledWriteKeys = uploadEnabledWriteKeys
+	h.uploadEnabledWriteKeysMu.Unlock()
+	h.recordHistoricEvents(uploadEnabledWriteKeys)
+}
+
+func (h *Handle) backendConfigSubscriber(backendConfig backendconfig.BackendConfig) {
+	ch := backendConfig.Subscribe(h.ctx, backendconfig.TopicProcessConfig)
+	for c := range ch {
+		h.updateConfig(c.Data.(map[string]backendconfig.ConfigT))
+		select {
+		case <-h.initialized:
+		default:
+			close(h.initialized)
+		}
+	}
+	close(h.done)
+}
+
+// recordHistoricEvents sends the events collected in cache as live events.
+// This is called on config update.
+// IMP: The function must be called before releasing configSubscriberLock lock to ensure the order of RecordEvent call
+func (h *Handle) recordHistoricEvents(uploadEnabledWriteKeys []string) {
+	for _, writeKey := range uploadEnabledWriteKeys {
+		historicEvents, err := h.eventsCache.Read(writeKey)
+		if err != nil {
+			continue
+		}
+		for _, eventBatchData := range historicEvents {
+			h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatchData})
+		}
+	}
+}
+
+type EventUploader struct {
+	log logger.Logger
+}
+
+func NewEventUploader(log logger.Logger) *EventUploader {
+	return &EventUploader{log: log}
+}
+
+func (e *EventUploader) Transform(eventBuffer []*GatewayEventBatchT) ([]byte, error) {
 	res := make(map[string]interface{})
 	res["version"] = "v2"
-	for _, e := range eventBuffer {
-		event := e.(*GatewayEventBatchT)
-		batchedEvent := EventUploadBatchT{}
-		err := json.Unmarshal([]byte(event.eventBatch), &batchedEvent)
+	for _, event := range eventBuffer {
+		var batchedEvent EventUploadBatchT
+		err := json.Unmarshal(event.EventBatch, &batchedEvent)
 		if err != nil {
-			pkgLogger.Errorf("[Source live events] Failed to unmarshal. Err: %v", err)
+			e.log.Errorf("[Source live events] Failed to unmarshal. Err: %v", err)
 			continue
 		}
 
@@ -109,8 +200,6 @@ func (eventUploader *EventUploader) Transform(data interface{}) ([]byte, error) 
 		var arr []EventUploadT
 		if value, ok := res[batchedEvent.WriteKey]; ok {
 			arr, _ = value.([]EventUploadT)
-		} else {
-			arr = make([]EventUploadT, 0)
 		}
 
 		for _, ev := range batchedEvent.Batch {
@@ -118,8 +207,8 @@ func (eventUploader *EventUploader) Transform(data interface{}) ([]byte, error) 
 			event := map[string]interface{}{
 				"payload":       ev,
 				"receivedAt":    receivedAtStr,
-				"eventName":     misc.GetStringifiedData(ev["event"]),
-				"eventType":     misc.GetStringifiedData(ev["type"]),
+				"eventName":     stringify.Any(ev["event"]),
+				"eventType":     stringify.Any(ev["type"]),
 				"errorResponse": make(map[string]interface{}),
 				"errorCode":     200,
 			}
@@ -131,31 +220,25 @@ func (eventUploader *EventUploader) Transform(data interface{}) ([]byte, error) 
 
 	rawJSON, err := json.Marshal(res)
 	if err != nil {
-		pkgLogger.Errorf("[Source live events] Failed to marshal payload. Err: %v", err)
+		e.log.Errorf("[Source live events] Failed to marshal payload. Err: %v", err)
 		return nil, err
 	}
 
 	return rawJSON, nil
 }
 
-func updateConfig(sources backendconfig.ConfigT) {
-	configSubscriberLock.Lock()
-	uploadEnabledWriteKeys = []string{}
-	for _, source := range sources.Sources {
-		if source.Config != nil {
-			if source.Enabled && source.Config["eventUpload"] == true {
-				uploadEnabledWriteKeys = append(uploadEnabledWriteKeys, source.WriteKey)
-			}
-		}
-	}
-	configSubscriberLock.Unlock()
+func NewNoOpService() SourceDebugger {
+	return &noopService{}
 }
 
-func backendConfigSubscriber(backendConfig backendconfig.BackendConfig) {
-	configChannel := make(chan utils.DataEvent)
-	backendConfig.Subscribe(configChannel, backendconfig.TopicProcessConfig)
-	for {
-		config := <-configChannel
-		updateConfig(config.Data.(backendconfig.ConfigT))
-	}
+type noopService struct{}
+
+func (*noopService) Start(_ backendconfig.BackendConfig) {
+}
+
+func (*noopService) RecordEvent(_ string, _ []byte) bool {
+	return false
+}
+
+func (*noopService) Stop() {
 }

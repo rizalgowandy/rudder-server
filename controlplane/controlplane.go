@@ -6,8 +6,9 @@ import (
 	"net"
 
 	"github.com/hashicorp/yamux"
-	proto "github.com/rudderlabs/rudder-server/proto/common"
 	"google.golang.org/grpc"
+
+	proto "github.com/rudderlabs/rudder-server/proto/common"
 )
 
 type ConnHandler struct {
@@ -37,7 +38,7 @@ func (cm *ConnectionManager) establishConnection() (*ConnHandler, error) {
 		return nil, err
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(cm.Options...)
 	service := &authService{authInfo: cm.AuthInfo}
 	proto.RegisterDPAuthServiceServer(grpcServer, service)
 	cn := &ConnHandler{
@@ -49,7 +50,7 @@ func (cm *ConnectionManager) establishConnection() (*ConnHandler, error) {
 }
 
 func (c *ConnHandler) ServeOnConnection() error {
-	c.logger.Info(fmt.Sprintf("starting grpc server"))
+	c.logger.Info("starting grpc server")
 	if err := c.GRPCServer.Serve(c.YamuxSess); err != nil {
 		return fmt.Errorf("failed to serve grpc: %w", err)
 	}
@@ -58,7 +59,7 @@ func (c *ConnHandler) ServeOnConnection() error {
 }
 
 func (c *ConnHandler) Close() error {
-	c.logger.Info(fmt.Sprintf("closing grpc connection"))
+	c.logger.Info("closing grpc connection")
 	c.GRPCServer.GracefulStop()
 	if err := c.YamuxSess.Close(); err != nil {
 		return fmt.Errorf("failed to close grpc: %w", err)

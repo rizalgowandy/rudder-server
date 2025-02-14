@@ -1,46 +1,31 @@
 package integrations
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/tidwall/gjson"
+
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/utils/types"
-	"github.com/rudderlabs/rudder-server/warehouse"
-	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/tidwall/gjson"
 )
 
 var (
-	destTransformURL      string
+	json                  = jsoniter.ConfigCompatibleWithStandardLibrary
 	postParametersTFields []string
 )
 
-func Init() {
-	loadConfig()
+func init() {
 	// This is called in init and it should be a one time call. Making reflect calls during runtime is not a great idea.
 	// We unmarshal json response from transformer into PostParametersT struct.
 	// Since unmarshal doesn't check if the fields are present in the json or not and instead just initialze to zero value, we have to manually do this check on all fields before unmarshaling
 	// This function gets a list of fields tagged as json from the struct and populates in postParametersTFields
 	postParametersTFields = misc.GetMandatoryJSONFieldNames(PostParametersT{})
 }
-
-func loadConfig() {
-	destTransformURL = config.GetEnv("DEST_TRANSFORM_URL", "http://localhost:9090")
-}
-
-const (
-	//PostDataKV means post data is sent as KV
-	PostDataKV = iota + 1
-	//PostDataJSON means post data is sent as JSON
-	PostDataJSON
-	//PostDataXML means post data is sent as XML
-	PostDataXML
-)
 
 // PostParametersT is a struct for holding all the values from transformerResponse and use them to publish an event to a destination
 // optional is a custom tag introduced by us and is handled by GetMandatoryJSONFieldNames. Its intentionally added
@@ -49,12 +34,38 @@ type PostParametersT struct {
 	Type          string `json:"type"`
 	URL           string `json:"endpoint"`
 	RequestMethod string `json:"method"`
-	//Invalid tag used in struct. skipcq: SCC-SA5008
-	UserID      string                 `json:"userId,,optional"`
+	// Invalid tag used in struct. skipcq: SCC-SA5008
+	UserID      string                 `json:"userId,,optional"` //nolint:staticcheck
 	Headers     map[string]interface{} `json:"headers"`
 	QueryParams map[string]interface{} `json:"params"`
 	Body        map[string]interface{} `json:"body"`
 	Files       map[string]interface{} `json:"files"`
+}
+
+type TransStatsT struct {
+	StatTags map[string]string `json:"statTags"`
+}
+
+func CollectDestErrorStats(input []byte) {
+	var integrationStat TransStatsT
+	err := json.Unmarshal(input, &integrationStat)
+	if err == nil {
+		if len(integrationStat.StatTags) > 0 {
+			stats.Default.NewTaggedStat("integration.failure_detailed", stats.CountType, integrationStat.StatTags).Increment()
+		}
+	}
+}
+
+func CollectIntgTransformErrorStats(input []byte) {
+	var integrationStats []TransStatsT
+	err := json.Unmarshal(input, &integrationStats)
+	if err == nil {
+		for _, integrationStat := range integrationStats {
+			if len(integrationStat.StatTags) > 0 {
+				stats.Default.NewTaggedStat("integration.failure_detailed", stats.CountType, integrationStat.StatTags).Increment()
+			}
+		}
+	}
 }
 
 // GetPostInfo parses the transformer response
@@ -80,8 +91,8 @@ func ValidatePostInfo(transformRawParams PostParametersT) error {
 	return nil
 }
 
-//FilterClientIntegrations parses the destination names from the
-//input JSON, matches them with enabled destinations from controle plane and returns the IDSs
+// FilterClientIntegrations parses the destination names from the
+// input JSON, matches them with enabled destinations from controle plane and returns the IDSs
 func FilterClientIntegrations(clientEvent types.SingularEventT, destNameIDMap map[string]backendconfig.DestinationDefinitionT) (retVal []string) {
 	clientIntgs, ok := misc.GetRudderEventVal("integrations", clientEvent)
 	if !ok {
@@ -123,37 +134,4 @@ func FilterClientIntegrations(clientEvent types.SingularEventT, destNameIDMap ma
 	}
 	retVal = outVal
 	return
-}
-
-//GetTransformerURL gets the transfomer base url endpoint
-func GetTransformerURL() string {
-	return destTransformURL
-}
-
-//GetDestinationURL returns node URL
-func GetDestinationURL(destType string) string {
-	destinationEndPoint := fmt.Sprintf("%s/v0/%s", destTransformURL, strings.ToLower(destType))
-	if misc.Contains(warehouse.WarehouseDestinations, destType) {
-		whSchemaVersionQueryParam := fmt.Sprintf("whSchemaVersion=%s&whIDResolve=%v", config.GetWHSchemaVersion(), warehouseutils.IDResolutionEnabled())
-		if destType == "RS" {
-			rsAlterStringToTextQueryParam := fmt.Sprintf("rsAlterStringToText=%s", fmt.Sprintf("%v", config.GetVarCharMaxForRS()))
-			return destinationEndPoint + "?" + whSchemaVersionQueryParam + "&" + rsAlterStringToTextQueryParam
-		}
-		if destType == "CLICKHOUSE" {
-			enableArraySupport := fmt.Sprintf("chEnableArraySupport=%s", fmt.Sprintf("%v", config.GetArraySupportForCH()))
-			return destinationEndPoint + "?" + whSchemaVersionQueryParam + "&" + enableArraySupport
-		}
-		return destinationEndPoint + "?" + whSchemaVersionQueryParam
-	}
-	return destinationEndPoint
-}
-
-//GetUserTransformURL returns the port of running user transform
-func GetUserTransformURL() string {
-	return destTransformURL + "/customTransform"
-}
-
-//GetTrackingPlanValidationURL returns the port of running tracking plan validation
-func GetTrackingPlanValidationURL() string {
-	return destTransformURL + "/v0/validate"
 }

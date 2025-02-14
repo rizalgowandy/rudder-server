@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/rudderlabs/analytics-go"
-	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
@@ -26,7 +26,6 @@ const (
 	RouterSuccess          = "router_success"
 	RouterFailed           = "router_failed"
 	RouterDestination      = "router_destination"
-	RouterAttemptNum       = "router_attempt_num"
 	RouterCompletedTime    = "router_average_job_time"
 	BatchRouterEvents      = "batch_router_events"
 	BatchRouterSuccess     = "batch_router_success"
@@ -41,8 +40,6 @@ const (
 
 var (
 	EnableDiagnostics               bool
-	endpoint                        string
-	writekey                        string
 	EnableServerStartMetric         bool
 	EnableConfigIdentifyMetric      bool
 	EnableServerStartedMetric       bool
@@ -51,6 +48,9 @@ var (
 	EnableRouterMetric              bool
 	EnableBatchRouterMetric         bool
 	EnableDestinationFailuresMetric bool
+
+	endpoint string
+	writekey string
 )
 var Diagnostics DiagnosticsI
 
@@ -72,23 +72,23 @@ func Init() {
 }
 
 func loadConfig() {
-	config.RegisterBoolConfigVariable(true, &EnableDiagnostics, false, "Diagnostics.enableDiagnostics")
-	config.RegisterStringConfigVariable("https://rudderstack-dataplane.rudderstack.com", &endpoint, false, "Diagnostics.endpoint")
-	config.RegisterStringConfigVariable("1aWPBIROQvFYW9FHxgc03nUsLza", &writekey, false, "Diagnostics.writekey")
-	config.RegisterBoolConfigVariable(true, &EnableServerStartMetric, false, "Diagnostics.enableServerStartMetric")
-	config.RegisterBoolConfigVariable(true, &EnableConfigIdentifyMetric, false, "Diagnostics.enableConfigIdentifyMetric")
-	config.RegisterBoolConfigVariable(true, &EnableServerStartedMetric, false, "Diagnostics.enableServerStartedMetric")
-	config.RegisterBoolConfigVariable(true, &EnableConfigProcessedMetric, false, "Diagnostics.enableConfigProcessedMetric")
-	config.RegisterBoolConfigVariable(true, &EnableGatewayMetric, false, "Diagnostics.enableGatewayMetric")
-	config.RegisterBoolConfigVariable(true, &EnableRouterMetric, false, "Diagnostics.enableRouterMetric")
-	config.RegisterBoolConfigVariable(true, &EnableBatchRouterMetric, false, "Diagnostics.enableBatchRouterMetric")
-	config.RegisterBoolConfigVariable(true, &EnableDestinationFailuresMetric, false, "Diagnostics.enableDestinationFailuresMetric")
+	EnableDiagnostics = config.GetBoolVar(true, "Diagnostics.enableDiagnostics")
+	endpoint = config.GetStringVar("https://rudderstack-dataplane.rudderstack.com", "Diagnostics.endpoint")
+	writekey = config.GetStringVar("1aWPBIROQvFYW9FHxgc03nUsLza", "Diagnostics.writekey")
+	EnableServerStartMetric = config.GetBoolVar(true, "Diagnostics.enableServerStartMetric")
+	EnableConfigIdentifyMetric = config.GetBoolVar(true, "Diagnostics.enableConfigIdentifyMetric")
+	EnableServerStartedMetric = config.GetBoolVar(true, "Diagnostics.enableServerStartedMetric")
+	EnableConfigProcessedMetric = config.GetBoolVar(true, "Diagnostics.enableConfigProcessedMetric")
+	EnableGatewayMetric = config.GetBoolVar(true, "Diagnostics.enableGatewayMetric")
+	EnableRouterMetric = config.GetBoolVar(true, "Diagnostics.enableRouterMetric")
+	EnableBatchRouterMetric = config.GetBoolVar(true, "Diagnostics.enableBatchRouterMetric")
+	EnableDestinationFailuresMetric = config.GetBoolVar(true, "Diagnostics.enableDestinationFailuresMetric")
 	Diagnostics = newDiagnostics()
 }
 
 // newDiagnostics return new instace of diagnostics
 func newDiagnostics() *diagnostics {
-	instanceId := config.GetEnv("INSTANCE_ID", "1")
+	instanceId := config.GetString("INSTANCE_ID", "1")
 
 	client := analytics.New(writekey, endpoint)
 	return &diagnostics{
@@ -104,7 +104,7 @@ func (d *diagnostics) Track(event string, properties map[string]interface{}) {
 		properties[StartTime] = d.StartTime
 		properties[InstanceId] = d.InstanceId
 
-		d.Client.Enqueue(
+		_ = d.Client.Enqueue(
 			analytics.Track{
 				Event:       event,
 				Properties:  properties,
@@ -115,12 +115,7 @@ func (d *diagnostics) Track(event string, properties map[string]interface{}) {
 	}
 }
 
-// Deprecated! Use instance of diagnostics instead;
-func Track(event string, properties map[string]interface{}) {
-	Diagnostics.Track(event, properties)
-}
-
-func (d *diagnostics) DisableMetrics(enableMetrics bool) {
+func (*diagnostics) DisableMetrics(enableMetrics bool) {
 	if !enableMetrics {
 		EnableServerStartedMetric = false
 		EnableConfigProcessedMetric = false
@@ -131,27 +126,17 @@ func (d *diagnostics) DisableMetrics(enableMetrics bool) {
 	}
 }
 
-// Deprecated! Use instance of diagnostics instead;
-func DisableMetrics(enableMetrics bool) {
-	Diagnostics.DisableMetrics(enableMetrics)
-}
-
 func (d *diagnostics) Identify(properties map[string]interface{}) {
 	if EnableDiagnostics {
 		// add in traits
 		if val, ok := properties[ConfigIdentify]; ok {
 			d.UserId = val.(string)
 		}
-		d.Client.Enqueue(
+		_ = d.Client.Enqueue(
 			analytics.Identify{
 				AnonymousId: d.UniqueId,
 				UserId:      d.UserId,
 			},
 		)
 	}
-}
-
-// Deprecated! Use instance of diagnostics instead;
-func Identify(properties map[string]interface{}) {
-	Diagnostics.Identify(properties)
 }

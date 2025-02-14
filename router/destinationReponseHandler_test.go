@@ -3,14 +3,17 @@ package router_test
 import (
 	"encoding/json"
 	"fmt"
-	. "github.com/onsi/ginkgo"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-server/router"
 )
 
 var _ = Describe("DestinationReponseHandler", func() {
 	var (
-		jsonHandler router.ResponseHandlerI
+		jsonHandler router.ResponseHandler
 		body        string
 		rules       map[string]interface{}
 	)
@@ -32,7 +35,7 @@ var _ = Describe("DestinationReponseHandler", func() {
 		if err := json.Unmarshal([]byte(config), &rules); err != nil {
 			fmt.Println(err)
 		}
-		jsonHandler = router.New(rules)
+		jsonHandler = router.NewResponseHandler(logger.NOP, rules)
 	})
 	Context("Passing rules and body to be validates", func() {
 		It("Non 200 codes are gives as is", func() {
@@ -81,7 +84,7 @@ var _ = Describe("DestinationReponseHandler", func() {
 			if err := json.Unmarshal([]byte(config), &rules); err != nil {
 				fmt.Println(err)
 			}
-			jsonHandler = router.New(rules)
+			jsonHandler = router.NewResponseHandler(logger.NOP, rules)
 			Expect(jsonHandler).To(BeNil())
 		})
 		It("when rules for a responseType are not present, handler will be nil", func() {
@@ -94,7 +97,7 @@ var _ = Describe("DestinationReponseHandler", func() {
 			if err := json.Unmarshal([]byte(config), &rules1); err != nil {
 				fmt.Println(err)
 			}
-			jsonHandler = router.New(rules1)
+			jsonHandler = router.NewResponseHandler(logger.NOP, rules1)
 			Expect(jsonHandler).To(BeNil())
 		})
 	})

@@ -3,11 +3,13 @@ package client
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/bigquery"
-	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 	"google.golang.org/api/iterator"
+
+	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
 const (
@@ -23,13 +25,13 @@ type Client struct {
 
 func (cl *Client) sqlQuery(statement string) (result warehouseutils.QueryResult, err error) {
 	rows, err := cl.SQL.Query(statement)
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return result, err
 	}
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return result, nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result.Columns, err = rows.Columns()
 	if err != nil {
@@ -46,6 +48,12 @@ func (cl *Client) sqlQuery(statement string) (result warehouseutils.QueryResult,
 		}
 
 		err = rows.Scan(valuePtrs...)
+		for i := 0; i < colCount; i++ {
+			switch t := values[i].(type) {
+			case []uint8:
+				values[i] = string(t)
+			}
+		}
 		if err != nil {
 			return result, err
 		}
@@ -55,28 +63,29 @@ func (cl *Client) sqlQuery(statement string) (result warehouseutils.QueryResult,
 		}
 		result.Values = append(result.Values, stringRow)
 	}
+	err = rows.Err()
 	return result, err
 }
 
 func (cl *Client) bqQuery(statement string) (result warehouseutils.QueryResult, err error) {
 	query := cl.BQ.Query(statement)
-	context := context.Background()
-	it, err := query.Read(context)
+	ctx := context.Background()
+	it, err := query.Read(ctx)
 	if err != nil {
 		return
 	}
 
 	for index := 0; index < len(it.Schema); index++ {
-		result.Columns = append(result.Columns, (*it.Schema[index]).Name)
+		result.Columns = append(result.Columns, (it.Schema[index]).Name)
 	}
 
 	for {
 		var row []bigquery.Value
 		err = it.Next(&row)
-		if err == iterator.Done {
-			break
-		}
 		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
 			return
 		}
 		var stringRow []string
@@ -100,8 +109,8 @@ func (cl *Client) Query(statement string) (result warehouseutils.QueryResult, er
 func (cl *Client) Close() {
 	switch cl.Type {
 	case BQClient:
-		cl.BQ.Close()
+		_ = cl.BQ.Close()
 	default:
-		cl.SQL.Close()
+		_ = cl.SQL.Close()
 	}
 }

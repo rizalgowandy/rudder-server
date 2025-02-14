@@ -5,24 +5,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/mock/gomock"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
+	"go.uber.org/mock/gomock"
+
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 // AsyncTestHelper provides synchronization methods to test goroutines.
 // Example:
-//		var (
-// 			asyncHelper testutils.AsyncTestHelper
-// 		)
 //
-//		BeforeEach(func() {
-//			mockMyInterface.EXPECT().MyMethodInGoroutine().Do(asyncHelper.ExpectAndNotifyCallback())
-//		})
+//	var (
+//		asyncHelper testutils.AsyncTestHelper
+//	)
 //
-// 		AfterEach(func() {
-//			asyncHelper.WaitWithTimeout(time.Second)
-//		})
+//	BeforeEach(func() {
+//		mockMyInterface.EXPECT().MyMethodInGoroutine().Do(asyncHelper.ExpectAndNotifyCallback())
+//	})
+//
+//	AfterEach(func() {
+//		asyncHelper.WaitWithTimeout(time.Second)
+//	})
 type AsyncTestHelper struct {
 	wg             sync.WaitGroup
 	waitingMap     map[string]int
@@ -41,7 +43,6 @@ func (helper *AsyncTestHelper) ExpectAndNotifyCallback() func(...interface{}) {
 // ExpectAndNotifyCallback Adds one to this helper's WaitGroup, and provides a callback that calls Done on it.
 // Should be used for gomock Do calls that trigger via mocked functions executed in a goroutine.
 func (helper *AsyncTestHelper) ExpectAndNotifyCallbackWithName(name string) func(...interface{}) {
-
 	helper.waitingMapLock.Lock()
 	defer helper.waitingMapLock.Unlock()
 
@@ -57,6 +58,18 @@ func (helper *AsyncTestHelper) ExpectAndNotifyCallbackWithName(name string) func
 
 		helper.wg.Done()
 		helper.waitingMap[name]--
+	}
+}
+
+// ExpectAndNotifyCallback Adds one to this helper's WaitGroup, and provides a callback that calls Done on it.
+// Should be used for gomock Do calls that trigger via mocked functions executed in a goroutine.
+func (helper *AsyncTestHelper) ExpectAndNotifyCallbackWithNameOnce(name string) func() {
+	var s sync.Once
+	f := helper.ExpectAndNotifyCallbackWithName(name)
+	return func() {
+		s.Do(func() {
+			f()
+		})
 	}
 }
 

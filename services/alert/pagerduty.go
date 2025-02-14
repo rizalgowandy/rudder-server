@@ -3,17 +3,21 @@ package alert
 import (
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"time"
 
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	kithttputil "github.com/rudderlabs/rudder-go-kit/httputil"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 )
 
-var pagerDutyEndPoint = "https://events.pagerduty.com/v2/enqueue"
-var pkgLogger logger.LoggerI
+var (
+	pagerDutyEndPoint = "https://events.pagerduty.com/v2/enqueue"
+	pkgLogger         logger.Logger
+)
 
 func (ops *PagerDuty) Alert(message string) {
-
 	payload := map[string]interface{}{
 		"summary":  message,
 		"severity": "critical",
@@ -27,7 +31,7 @@ func (ops *PagerDuty) Alert(message string) {
 	}
 
 	eventJSON, _ := json.Marshal(event)
-	client := &http.Client{}
+	client := &http.Client{Timeout: config.GetDuration("HttpClient.pagerduty.timeout", 30, time.Second)}
 	resp, err := client.Post(pagerDutyEndPoint, "application/json", bytes.NewBuffer(eventJSON))
 	// Not handling errors when sending alert to victorops
 	if err != nil {
@@ -39,8 +43,8 @@ func (ops *PagerDuty) Alert(message string) {
 		pkgLogger.Errorf("Alert: Got error response %d", resp.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	defer func() { kithttputil.CloseResponse(resp) }()
 	if err != nil {
 		pkgLogger.Errorf("Alert: Failed to read response body: %s", err.Error())
 		return

@@ -1,6 +1,6 @@
 package app
 
-//go:generate mockgen -destination=../mocks/app/mock_app.go -package=mock_app github.com/rudderlabs/rudder-server/app Interface
+//go:generate mockgen -destination=../mocks/app/mock_app.go -package=mock_app github.com/rudderlabs/rudder-server/app App
 
 import (
 	"fmt"
@@ -10,11 +10,16 @@ import (
 	"runtime/pprof"
 	"strings"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-server/enterprise/trackedusers"
+
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	configenv "github.com/rudderlabs/rudder-server/enterprise/config-env"
+	"github.com/rudderlabs/rudder-server/enterprise/reporting"
+	suppression "github.com/rudderlabs/rudder-server/enterprise/suppress-user"
 	"github.com/rudderlabs/rudder-server/jobsdb"
-	"github.com/rudderlabs/rudder-server/services/db"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 const (
@@ -23,40 +28,40 @@ const (
 	EMBEDDED  = "EMBEDDED"
 )
 
-// App holds the main application's configuration and state
-type App struct {
-	options  *Options
-	features *Features // Enterprise features, if available
-
-	cpuprofileOutput *os.File
-}
-
-// Interface of a rudder-server application
-type Interface interface {
+// App represents a rudder-server application
+type App interface {
 	Setup()              // Initializes application
 	Stop()               // Stop application
 	Options() *Options   // Get this application's options
 	Features() *Features // Get this application's enterprise features
 }
 
-var pkgLogger logger.LoggerI
+// app holds the main application's configuration and state
+type app struct {
+	log      logger.Logger
+	options  *Options
+	features *Features // Enterprise features, if available
 
-func Init() {
-	pkgLogger = logger.NewLogger().Child("app")
+	cpuprofileOutput *os.File
 }
 
 // Setup initializes application
-func (a *App) Setup() {
+func (a *app) Setup() {
 	// If cpuprofile flag is present, setup cpu profiling
 	if a.options.Cpuprofile != "" {
 		a.initCPUProfiling()
 	}
 
-	// initialize enterprise features, if available
-	a.initEnterpriseFeatures()
+	if a.options.EnterpriseToken == "" {
+		a.log.Info("Open source version of rudder-server")
+	} else {
+		a.log.Info("Enterprise version of rudder-server")
+	}
+
+	a.initFeatures()
 }
 
-func (a *App) initCPUProfiling() {
+func (a *app) initCPUProfiling() {
 	var err error
 	a.cpuprofileOutput, err = os.Create(a.options.Cpuprofile)
 	if err != nil {
@@ -67,49 +72,45 @@ func (a *App) initCPUProfiling() {
 	if err != nil {
 		panic(err)
 	}
-
 }
 
-func (a *App) initEnterpriseFeatures() {
-	a.features = &Features{}
-
-	if migratorFeatureSetup != nil {
-		a.features.Migrator = migratorFeatureSetup(a)
-	}
-
-	if suppressUserFeatureSetup != nil {
-		a.features.SuppressUser = suppressUserFeatureSetup(a)
-	}
-
-	if configEnvFeatureSetup != nil {
-		a.features.ConfigEnv = configEnvFeatureSetup(a)
-	}
-
-	if reportingFeatureSetup != nil {
-		a.features.Reporting = reportingFeatureSetup(a)
-	}
-
-	if replayFeatureSetup != nil {
-		a.features.Replay = replayFeatureSetup(a)
+func (a *app) initFeatures() {
+	enterpriseLogger := logger.NewLogger().Child("enterprise")
+	a.features = &Features{
+		SuppressUser: &suppression.Factory{
+			EnterpriseToken: a.options.EnterpriseToken,
+			Log:             enterpriseLogger.Child("suppress-user"),
+		},
+		Reporting: &reporting.Factory{
+			EnterpriseToken: a.options.EnterpriseToken,
+			Log:             enterpriseLogger.Child("reporting"),
+		},
+		ConfigEnv: &configenv.Factory{
+			EnterpriseToken: a.options.EnterpriseToken,
+			Log:             enterpriseLogger.Child("config-env"),
+		},
+		TrackedUsers: &trackedusers.Factory{
+			Log: enterpriseLogger.Child("tracked-users"),
+		},
 	}
 }
 
 // Options returns this application's options
-func (a *App) Options() *Options {
+func (a *app) Options() *Options {
 	return a.options
 }
 
 // Features returns this application's enterprise features
-func (a *App) Features() *Features {
+func (a *app) Features() *Features {
 	return a.features
 }
 
 // Stop stops application
-func (a *App) Stop() {
+func (a *app) Stop() {
 	if a.options.Cpuprofile != "" {
-		pkgLogger.Info("Stopping CPU profile")
+		a.log.Info("Stopping CPU profile")
 		pprof.StopCPUProfile()
-		a.cpuprofileOutput.Close()
+		_ = a.cpuprofileOutput.Close()
 	}
 
 	if a.options.Memprofile != "" {
@@ -117,7 +118,7 @@ func (a *App) Stop() {
 		if err != nil {
 			panic(err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		runtime.GC() // get up-to-date statistics
 		err = pprof.WriteHeapProfile(f)
 		if err != nil {
@@ -127,28 +128,46 @@ func (a *App) Stop() {
 }
 
 // New creates a new application instance
-func New(options *Options) Interface {
-	return &App{
+func New(options *Options) App {
+	return &app{
+		log:     logger.NewLogger().Child("app"),
 		options: options,
 	}
 }
 
-//HealthHandler is the http handler for health endpoint
-func HealthHandler(w http.ResponseWriter, r *http.Request, jobsDB jobsdb.JobsDB) {
-	var dbService string = "UP"
-	var enabledRouter string = "TRUE"
-	var backendConfigMode string = "API"
-	if !jobsDB.CheckPGHealth() {
-		dbService = "DOWN"
+// LivenessHandler is the http handler for the Kubernetes liveness probe
+func LivenessHandler(jobsDB jobsdb.JobsDB) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		healthy, responsePayload := getHealthVal(jobsDB)
+		if !healthy {
+			http.Error(w, "Cannot connect to db", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(responsePayload))
 	}
+}
+
+func getHealthVal(jobsDB jobsdb.JobsDB) (bool, string) {
+	dbService := "UP"
+	healthy := true
+	if jobsDB.Ping() != nil {
+		dbService = "DOWN"
+		healthy = false
+	}
+	enabledRouter := "TRUE"
 	if !config.GetBool("enableRouter", true) {
 		enabledRouter = "FALSE"
 	}
+	backendConfigMode := "API"
 	if config.GetBool("BackendConfig.configFromFile", false) {
 		backendConfigMode = "JSON"
 	}
 
-	appTypeStr := strings.ToUpper(config.GetEnv("APP_TYPE", EMBEDDED))
-	healthVal := fmt.Sprintf(`{"appType": "%s", "server":"UP", "db":"%s","acceptingEvents":"TRUE","routingEvents":"%s","mode":"%s","goroutines":"%d", "backendConfigMode": "%s", "lastSync":"%s", "lastRegulationSync":"%s"}`, appTypeStr, dbService, enabledRouter, strings.ToUpper(db.CurrentMode), runtime.NumGoroutine(), backendConfigMode, backendconfig.LastSync, backendconfig.LastRegulationSync)
-	w.Write([]byte(healthVal))
+	appTypeStr := strings.ToUpper(config.GetString("APP_TYPE", EMBEDDED))
+	return healthy, fmt.Sprintf(
+		`{"appType":"%s","server":"UP","db":"%s","acceptingEvents":"TRUE","routingEvents":"%s","mode":"NORMAL",`+
+			`"backendConfigMode":"%s","lastSync":"%s","lastRegulationSync":"%s"}`,
+		appTypeStr, dbService, enabledRouter,
+		backendConfigMode, backendconfig.LastSync, backendconfig.LastRegulationSync,
+	)
 }
